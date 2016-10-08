@@ -1,0 +1,146 @@
+train <- read.csv("train.csv", header = T, na.strings = c("", "NA", "?"))
+test <- read.csv("test.csv", header = T, na.strings = c("", "NA", "?"))
+
+library(data.table)
+
+#set column classes
+factcols <- c(2:5,7,8:16,20:29,31:38,40,41)
+numcols <- setdiff(1:40,factcols)
+
+for (i in 1:41) {
+  if (i %in% factcols) {
+     train[,i] <- factor(train[,i]) }
+  else {
+     train[,i] <- as.numeric(train[,i])
+} }
+
+cat_train <- train[,factcols]
+num_train <- train[,numcols]
+
+library(plotly)
+library(ggplot2)
+
+## Histogram Fn:
+
+tr <- function(a){
+            ggplot(data = num_train, aes(x= a, y=..density..)) + geom_histogram(fill="blue",color="red",alpha = 0.5,bins =100) + geom_density()
+ ggplotly()
+}
+
+num_train$income_level <- cat_train$income_level
+
+#create a scatter plot
+ggplot(data=num_train,aes(x = age, y=wage_per_hour))+geom_point(aes(colour=income_level))+scale_y_continuous("wage per hour", breaks = seq(0,10000,1000))
+
+
+#dodged bar chart
+all_bar <- function(i){
+ ggplot(cat_train,aes(x=i,fill=income_level))+geom_bar(position = "dodge",  color="black")+scale_fill_brewer(palette = "Pastel1")+theme(axis.text.x =element_text(angle  = 60,hjust = 1,size=10))
+}
+
+library(caret)  
+findCorrelation(x = cor(num_train[,-8]), cutoff = 0.7)
+
+num_train <- num_train[,-7]
+
+mvtr <- sapply(cat_train, function(x){sum(is.na(x))/length(x)})*100
+cat_train <- subset(cat_train, select = mvtr < 5 )
+
+cat_train[] <- lapply(cat_train, as.character)
+
+## Set to Unavailable
+for (i in seq_along(cat_train)) set(cat_train, i=which(is.na(cat_train[[i]])), j=i, value="Unavailable")
+
+cat_train[] <- lapply(cat_train, as.factor)
+
+## Combine levels of less than 5% occurance under "Other"
+for(i in names(cat_train)){
+                  p <- 5/100
+                  ld <- names(which(prop.table(table(cat_train[[i]])) < p))
+                  levels(cat_train[[i]])[levels(cat_train[[i]]) %in% ld] <- "Other"
+}
+
+
+num_train <- num_train[,-7]
+d_train <- cbind(num_train,cat_train)
+rm(num_train,cat_train)
+
+library(mlr)
+train.task <- makeClassifTask(data = d_train,target = "income_level")
+train.task <- removeConstantFeatures(train.task)
+
+var_imp <- generateFilterValuesData(train.task, method = c("information.gain"))
+plotFilterValues(var_imp,feat.type.cols = TRUE)
+
+train.smote <- smote(train.task,rate = 10,nn = 3) 
+
+# Naive Bayes learner
+naive_learner <- makeLearner("classif.naiveBayes",predict.type = "response")
+naive_learner$par.vals <- list(laplace = 1)
+folds <- makeResampleDesc("CV",iters=10,stratify = TRUE)
+
+#Cross validation Fn:
+fun_cv <- function(a){
++     crv_val <- resample(naive_learner,a,folds,measures = list(acc,tpr,tnr,fpr,fp,fn))
++     crv_val$aggr
++ }
+
+
+fun_cv(train.smote)
+
+# NB Model:
+nB_model <- train(naive_learner, train.smote)
+nB_predict <- predict(nB_model,test.task)
+
+nB_prediction <- nB_predict$data$response
+dCM <- confusionMatrix(d_test$income_level,nB_prediction)
+
+
+#XG Boost
+
+xgb_learner <- makeLearner("classif.xgboost",predict.type = "response")
+
+xgb_learner$par.vals <- list(
+                      objective = "binary:logistic",
+                      eval_metric = "error",
+                      nrounds = 150,
+                      print.every.n = 50
+)
+
+xg_ps <- makeParamSet( 
++     makeIntegerParam("max_depth",lower=3,upper=10),
++     makeNumericParam("lambda",lower=0.05,upper=0.5),
++     makeNumericParam("eta", lower = 0.01, upper = 0.5),
++     makeNumericParam("subsample", lower = 0.50, upper = 1),
++     makeNumericParam("min_child_weight",lower=2,upper=10),
++     makeNumericParam("colsample_bytree",lower = 0.50,upper = 0.80)
++ )
+
+rancontrol <- makeTuneControlRandom(maxit = 5L)
+
+set_cv <- makeResampleDesc("CV",iters = 5L,stratify = TRUE)
+
+xgb_tune <- tuneParams(learner = xgb_learner, task = train.task, resampling = set_cv, measures = list(acc,tpr,tnr,fpr,fp,fn), par.set = xg_ps, control = rancontrol)
+
+xgb_new <- setHyperPars(learner = xgb_learner, par.vals = xgb_tune$x)
+
+xgmodel <- train(xgb_new, train.task)
+predict.xg <- predict(xgmodel, test.task)
+xg_prediction <- predict.xg$data$response
+confusionMatrix(d_test$income_level,xg_prediction)
+
+#XGB Probabilities so that cut off can be decided
+xgb_prob <- setPredictType(learner = xgb_new,predict.type = "prob")
+xgmodel_prob <- train(xgb_prob,train.task)
+
+predict.xgprob <- predict(xgmodel_prob,test.task)
+
+
+pred2 <- setThreshold(predict.xgprob,0.4)
+confusionMatrix(d_test$income_level,pred2$data$response)
+
+# Using top 20 features
+filtered.data <- filterFeatures(train.task,method = "information.gain",abs = 20)
+
+#train
+xgb_boost <- train(xgb_new,filtered.data)
